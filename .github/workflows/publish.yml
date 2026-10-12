@@ -1,0 +1,337 @@
+# 发布工作流模板（示例；**本仓库不创建远端仓库、不启用 Pages**）
+#
+# 目标用法（经用户确认后）：把本文件复制到**独立公开发布仓库**的
+# `.github/workflows/publish.yml`。该仓库只放：这个工作流 + `ops/deployment/` 下的发布工具
+# （`public_artifact_verify.py` 与 `researcher_finance_deploy/`）+ 说明文件；
+# **不放**采集代码、数据库、原始文件、日志或任何密钥。
+#
+# 首次启用前必须做（缺一项都不要启用）：
+#   1) **用户本人完成 gh 登录**（`gh auth login --hostname github.com --git-protocol ssh --web`）；
+#      这是唯一必须由用户做的凭据动作 —— 工具与工作流都不读凭据、不代登录。
+#   2) **创建公开仓库并启用 Pages**（Source = GitHub Actions）：授权已由用户在 `github_pages_target`
+#      选择中给出（"核对后新建公开仓库并启用 Pages"），由**发布执行者**在登录 + 发布检查通过后执行；
+#      **本仓库/本工作流自身不创建远端、不擅自开启 Pages**（configure-pages 用 `enablement: false`）。
+#   3) 用发布工具在 Linux 侧生成发布包并上传 Release 资产（`prepare` → `publish`）。
+#   4) 把 `version` / `sha256` / `build_id` 作为 workflow_dispatch 输入传入。
+#   5) 仓库 Settings → Actions → General 允许本工作流的权限（contents: read / pages: write / id-token: write）。
+#
+# 已修复的既有风险（原示例的问题 → 现在的做法）：
+#   * `<PINNED_SHA>` 占位 → 三个官方 action 均固定到**已核验的 release tag 提交**（见下方注释来源）；
+#   * `gh release download` 未指定仓库 → 显式 `--repo "${TARGET_REPO}"`；
+#   * `VERSION` 只在上一步的 env 里 → 改为 job 级 `env`，所有步骤都能读到（部署后核验不再用空值比较）；
+#   * `previous_version` 声明但没用 → 现在从**发布清单**读取 `rollback.previous_version`，
+#     并在运行摘要里给出**可复制的回滚命令**（同一个工作流、`mode=rollback`、同一套校验）。
+#     刻意**不引入独立的 rollback job**：回滚同样要过"校验包哈希 + 载荷闸门 + 顺序判定"，
+#     另开一条路径只会带来第二套语义与被绕过的风险；回滚仍会校验下载包的期望哈希。
+#   * `tar -tzf | grep -E '^(\.\.|/)'` 路径检查不完整 → 改用 `public_artifact_verify.py`：
+#     拒绝绝对路径、内部穿越、符号链接/硬链接/特殊文件、重复成员、超限大小/数量，**校验通过后才解包**；
+#   * 密钥/私有路径扫描用 grep（一次性 slurp 整个目录、命中即 exit 1 语义脆弱） → 由同一脚本按
+#     高置信度规则扫描（含本机私有路径与运行数据根路径）；
+#   * 无"构建身份" → 包内 `PUBLISH_MANIFEST.json` + `status.json` 必须与工作流输入的
+#     `version`/`build_id`/**载荷摘要**一致，否则拒绝部署；
+#   * 旧版本可能覆盖新版本 → 并发组 + **基于线上 status.json 的**顺序判定：
+#     首发（线上 404）允许；同一 build_id 幂等允许；**同版本号但 build_id 不同 = 身份冲突，显式拒绝**
+#     （不可变版本号下不允许换内容）；比线上更旧必须 mode=rollback；
+#     线上状态不可判定（5xx/超时/坏 JSON）一律拒绝（fail closed）。
+#     刻意**不用** `gh release view`：Release 是先建的，其 latest 恰好是本次版本。
+#   * 工作流执行仓库内脚本却从不 checkout → 现在显式 checkout（固定提交、只读、不落凭据）；
+#     没有这一步，干净 runner 上必然找不到 ops/deployment/public_artifact_verify.py。
+#   * 顺序判定步骤引用了**尚未运行**的 configure-pages 输出 → 现在用 job 级常量
+#     PAGES_BASE_URL；任何"引用未运行 step 输出"的写法都被结构测试拦下。
+#
+# 第三方 action 的核验来源（2026-10-12 实测，二者一致才写入）：
+#   actions/configure-pages@v6.0.0        → 45bfe0192ca1faeb007ade9deae92b16b8254a0d
+#   actions/upload-pages-artifact@v4.0.0  → 7b1f4a764d45c48632c6b24a0339c27f5614fb0b
+#   actions/deploy-pages@v5.0.1           → 368f82528645a54fb793d4d04e342629a3f51346
+#   actions/checkout@v5.1.0               → fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+#   核验命令：`git ls-remote --tags https://github.com/<owner>/<repo>.git 'refs/tags/v*'`
+#             与 `curl -fsS https://api.github.com/repos/<owner>/<repo>/git/ref/tags/<tag>`
+#   （两条命令的 object.type 都必须是 `commit`，SHA 必须一致）
+#   残余风险（如实记录）：`upload-pages-artifact@v4` 是 **composite** action，其内部还引用了
+#   `actions/upload-artifact@<tag>`；上游未固定该内部引用，本工作流无法替它固定。
+#
+# 不做的事：不使用 self-hosted runner（不把私有数据访问权带进公开仓库）；不调用任何业务 API；
+#   不读取任何仓库 secret（业务密钥始终留在 Linux 私有环境文件里，产物内不得携带）。
+
+name: publish-researcher-finance
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "不可变发布版本号（= Release tag，如 2026-10-12T04-00Z）"
+        required: true
+        type: string
+      sha256:
+        description: "发布包 SHA-256（由 Linux 侧 prepare 生成，64 位小写十六进制）"
+        required: true
+        type: string
+      build_id:
+        description: "构建标识（包内 PUBLISH_MANIFEST.json 的 build_id，如 rf-build-xxxxxxxxxxxxxxxx）"
+        required: true
+        type: string
+      mode:
+        description: "deploy = 正常上线（拒绝覆盖更新的线上）；rollback = 重新部署更旧的已发布版本"
+        required: false
+        default: deploy
+        type: choice
+        options:
+          - deploy
+          - rollback
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# 同一时刻只跑一个发布；后到的排队（不取消正在进行的运行）。
+# 加上下面的"版本单调守卫"，可以避免"较旧的运行覆盖较新的版本"。
+concurrency:
+  group: pages-publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    env:
+      # job 级 env：所有步骤都能读到（原示例只在第一步设置 VERSION，后续步骤拿到的是空串）
+      TARGET_REPO: Dr-JwWu/researcher-finance
+      VERSION: ${{ inputs.version }}
+      EXPECTED_SHA256: ${{ inputs.sha256 }}
+      EXPECTED_BUILD_ID: ${{ inputs.build_id }}
+      MODE: ${{ inputs.mode }}
+      PACKAGE_NAME: researcher-finance-site-${{ inputs.version }}.tar.gz
+      # F1：顺序判定**不能**引用尚未运行的 step 输出（configure-pages 之前 `steps.pages` 为空）。
+      # 这里用 job 级常量；站点地址是已确认目标的一部分，改目标时必须同时改这里。
+      PAGES_BASE_URL: https://dr-jwwu.github.io/researcher-finance
+    steps:
+      - name: Checkout the public release repo（只读；运行时才需要 ops/deployment 工具）
+        # 必需：下面的校验步骤要执行 `ops/deployment/public_artifact_verify.py`，
+        # 而 GitHub 的 runner **不会**自带仓库文件。没有这一步，工作流在干净 runner 上必然
+        # "No such file or directory"（captain 实测发现的缺陷 A）。
+        # 固定到已核验的官方 release tag 提交；凭据不落盘（persist-credentials: false），
+        # 权限只给 contents: read —— 发布过程不需要写仓库、也不需要任何业务密钥。
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+
+      - name: Validate inputs（拒绝非法版本号/摘要，避免把输入直接拼进 shell）
+        run: |
+          set -euo pipefail
+          case "${VERSION}" in
+            *[!A-Za-z0-9._+-]*|.*|*..*|'') echo "版本号不合法：${VERSION}"; exit 1 ;;
+          esac
+          case "${EXPECTED_SHA256}" in
+            *[!0-9a-f]*|'') echo "sha256 必须是 64 位小写十六进制"; exit 1 ;;
+          esac
+          [ "${#EXPECTED_SHA256}" -eq 64 ] || { echo "sha256 长度不是 64"; exit 1; }
+          case "${EXPECTED_BUILD_ID}" in
+            rf-build-[0-9a-f][0-9a-f]*) : ;;
+            *) echo "build_id 形式不合法：${EXPECTED_BUILD_ID}"; exit 1 ;;
+          esac
+          case "${MODE}" in deploy|rollback) : ;; *) echo "mode 非法：${MODE}"; exit 1 ;; esac
+          echo "输入校验通过：version=${VERSION} build_id=${EXPECTED_BUILD_ID} mode=${MODE}"
+
+      - name: Download the allowed release assets（显式 --repo；只取本仓库该 tag 的资产）
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p ./incoming
+          gh release download "${VERSION}" \
+            --repo "${TARGET_REPO}" \
+            --dir ./incoming \
+            --pattern "${PACKAGE_NAME}" \
+            --pattern 'SHA256SUMS' \
+            --pattern 'PUBLISH_MANIFEST.json' \
+            --pattern 'status.json'
+          ls -la ./incoming
+
+      - name: Decide deployment ordering from the LIVE site（不看 Release 是否存在）
+        # 为什么不用 `gh release view`：发布流程是"先建 Release、再触发工作流"，
+        # 因此 Release 的 latest **恰好就是本次待部署的 VERSION**；
+        # 用 "VERSION == latest ⇒ 拒绝" 会阻止每一次正常首发（缺陷 B）。
+        # 正确判据是**线上实际服务的版本**——站点根 status.json 里的 release_version/build_id。
+        #
+        # 地址来源：job 级常量 PAGES_BASE_URL（F1）。**不引用 step 输出**：
+        # 若引用 `steps.pages.outputs.base_url` 而 configure-pages 还没运行，得到空串 →
+        # curl 报 "URL rejected: No host part" → HTTP 000000 → fail closed → 每次部署都被拒。
+        run: |
+          set -euo pipefail
+          base="${PAGES_BASE_URL%/}"
+          state_dir="$(mktemp -d)"
+          code=$(curl -sS -o "${state_dir}/live.json" -w '%{http_code}' --max-time 30 "${base}/status.json" || echo "000")
+          echo "线上 status.json HTTP ${code}"
+          python3 - "${VERSION}" "${EXPECTED_BUILD_ID}" "${MODE}" "${code}" "${state_dir}/live.json" <<'PY'
+          import json, sys
+          from pathlib import Path
+
+          version, build_id, mode, code, live_path = sys.argv[1:6]
+          if code == "404":
+              print(f"[order] 线上尚无 status.json（404）：判定为首发，允许部署 {version}")
+              raise SystemExit(0)
+          if code != "200":
+              print(f"[order][FAIL] 线上 status.json 不可判定（HTTP {code}）：状态未知，拒绝部署（fail closed）")
+              raise SystemExit(1)
+          try:
+              live = json.loads(Path(live_path).read_text(encoding="utf-8"))
+          except Exception as exc:  # noqa: BLE001
+              print(f"[order][FAIL] 线上 status.json 不是合法 JSON：{exc}")
+              raise SystemExit(1)
+          deployed_version = live.get("release_version")
+          deployed_build = live.get("build_id")
+          if not deployed_version or not deployed_build:
+              print("[order][FAIL] 线上 status.json 缺 release_version/build_id：无法判定顺序，拒绝部署")
+              raise SystemExit(1)
+          print(f"[order] 线上：version={deployed_version} build_id={deployed_build}")
+          if deployed_build == build_id:
+              # 幂等短路**不能只看 build_id**：还必须核对载荷摘要与版本。
+              # 若线上同 build_id 却报了不同的 payload_sha256 / release_version，说明"同一构建身份"
+              # 对应了两份不同内容（清单/包被改动或线上被替换）⇒ 必须拒绝，而不是直接放行。
+              try:
+                  import json as _json
+                  packed = _json.loads(Path("incoming/status.json").read_text(encoding="utf-8"))
+              except Exception as exc:  # noqa: BLE001
+                  print(f"[order][FAIL] 无法读取包内 status.json 以核对幂等身份：{exc}")
+                  raise SystemExit(1)
+              live_payload = live.get("payload_sha256")
+              packed_payload = packed.get("payload_sha256")
+              if packed.get("release_version") != version:
+                  print(f"[order][FAIL] 包内 status.json 的 release_version={packed.get('release_version')!r} "
+                        f"与输入 {version!r} 不一致：拒绝")
+                  raise SystemExit(1)
+              if live_payload and packed_payload and live_payload != packed_payload:
+                  print(f"[order][FAIL] 线上与包内载荷摘要不同（同 build_id 却不同内容）："
+                        f"{live_payload} != {packed_payload}：拒绝部署")
+                  raise SystemExit(1)
+              print(f"[order] 幂等：线上已经是同一构建 {build_id}，且版本与载荷摘要一致，允许重新部署")
+              raise SystemExit(0)
+          if mode == "rollback":
+              if version >= deployed_version:
+                  print(f"[order][FAIL] 回滚目标 {version} 不比线上 {deployed_version} 旧：拒绝")
+                  raise SystemExit(1)
+              print(f"[order] 回滚：{deployed_version} → {version}（仍会校验包摘要）")
+              raise SystemExit(0)
+          if version < deployed_version:
+              print(f"[order][FAIL] 拒绝：{version} 比线上 {deployed_version} 旧；回退请用 mode=rollback")
+              raise SystemExit(1)
+          if version == deployed_version:
+              # 同版本号 + 不同 build_id = **身份冲突**（不可变版本号下换了内容）：
+              # 必须显式拒绝，绝不能落进"升级允许"分支（与 CLI order.py 的 identity-collision 同向）。
+              print(f"[order][FAIL] 身份冲突：版本 {version} 与线上相同，但 build_id 不同"
+                    f"（线上 {deployed_build} != 本次 {build_id}）：不可变版本不允许换内容，拒绝部署")
+              raise SystemExit(1)
+          print(f"[order] 升级：{deployed_version} → {version}（build_id {deployed_build} → {build_id}）")
+          PY
+
+      - name: Verify package checksum（双重校验：sha256sum -c + 与输入比对）
+        run: |
+          set -euo pipefail
+          cd ./incoming
+          actual=$(sha256sum "${PACKAGE_NAME}" | awk '{print $1}')
+          expected=$(awk '{print $1}' SHA256SUMS)
+          [ "${actual}" = "${expected}" ] || { echo "包摘要与 SHA256SUMS 不一致"; exit 1; }
+          [ "${actual}" = "${EXPECTED_SHA256}" ] || { echo "包摘要与工作流输入不一致"; exit 1; }
+          sha256sum -c --strict SHA256SUMS
+          echo "包摘要校验通过：${actual}"
+
+      - name: Validate + safely extract（拒绝穿越/链接/重复成员/解压炸弹；只在校验通过后解包）
+        run: |
+          set -euo pipefail
+          python3 ops/deployment/public_artifact_verify.py \
+            --archive "./incoming/${PACKAGE_NAME}" \
+            --out ./site \
+            --expected-sha256 "${EXPECTED_SHA256}" \
+            --expected-version "${VERSION}" \
+            --expected-build-id "${EXPECTED_BUILD_ID}" \
+            --report ./verify-report.json
+          test -f ./site/index.html
+          test -f ./site/status.json
+          echo "解包并核验通过；站点文件数：$(find ./site -type f | wc -l)"
+
+      - name: Refuse secrets / private paths / preview markers（脚本级扫描，非 grep）
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, pathlib
+          report = json.loads(pathlib.Path("verify-report.json").read_text(encoding="utf-8"))
+          assert report.get("ok") is True, report.get("problems")
+          gate = report.get("site_gate") or {}
+          assert gate.get("ok") is True, gate.get("problems")
+          print("[verify] 载荷闸门通过；扫描统计：", (gate.get("facts") or {}).get("scan"))
+          PY
+
+      - name: Configure Pages
+        id: pages
+        uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
+        with:
+          # 不自动开启 Pages：启用与否必须由仓库管理员显式决定（避免工作流擅自改仓库设置）
+          enablement: false
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@7b1f4a764d45c48632c6b24a0339c27f5614fb0b # v4.0.0
+        with:
+          path: ./site
+
+      - name: Deploy to GitHub Pages
+        id: deploy
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
+        with:
+          artifact_name: github-pages
+
+      - name: Verify the deployed build identity（线上 status.json 必须与本包一致）
+        env:
+          # 部署后用 deploy-pages 的真实输出（该步骤已运行）；同时与 job 常量比对
+          PAGE_URL: ${{ steps.deploy.outputs.page_url }}
+          EXPECTED_BASE_URL: ${{ env.PAGES_BASE_URL }}
+        run: |
+          set -euo pipefail
+          base="${PAGE_URL:-${EXPECTED_BASE_URL}}"
+          base="${base%/}"
+          case "${base,,}" in
+            "${EXPECTED_BASE_URL,,}") : ;;
+            *) echo "部署返回的 page_url (${base}) 与已确认站点地址 (${EXPECTED_BASE_URL}) 不一致"; exit 1 ;;
+          esac
+          for attempt in 1 2 3 4 5; do
+            if curl -fsS "${base}/status.json" -o ./deployed-status.json; then break; fi
+            echo "第 ${attempt} 次拉取 status.json 失败，等待 CDN 生效…"
+            sleep 10
+          done
+          test -f ./deployed-status.json || { echo "线上 status.json 不可读：无法核验部署身份"; exit 1; }
+          python3 - <<'PY'
+          import json, os, pathlib
+          deployed = json.loads(pathlib.Path("deployed-status.json").read_text(encoding="utf-8"))
+          packaged = json.loads(pathlib.Path("incoming/status.json").read_text(encoding="utf-8"))
+          expected_build = os.environ["EXPECTED_BUILD_ID"]
+          expected_version = os.environ["VERSION"]
+          problems = []
+          if deployed.get("build_id") != expected_build:
+              problems.append(f"线上 build_id={deployed.get('build_id')!r} != 期望 {expected_build!r}")
+          if deployed.get("release_version") != expected_version:
+              problems.append(f"线上 release_version={deployed.get('release_version')!r} != 期望 {expected_version!r}")
+          if deployed.get("build_id") != packaged.get("build_id"):
+              problems.append("线上 build_id 与发布包内 status.json 不一致")
+          if deployed.get("payload_sha256") != packaged.get("payload_sha256"):
+              problems.append("线上载荷摘要与发布包内 status.json 不一致")
+          if problems:
+              for item in problems:
+                  print(f"[verify][FAIL] {item}")
+              raise SystemExit(1)
+          print(f"[verify] 线上身份一致：version={expected_version} build_id={expected_build}")
+          PY
+
+      - name: Report rollback target（供需要回退时使用；本步骤不改动线上）
+        run: |
+          set -euo pipefail
+          previous=$(python3 -c "import json,sys;print((json.load(open('incoming/PUBLISH_MANIFEST.json')).get('rollback') or {}).get('previous_version') or '')")
+          if [ -n "${previous}" ]; then
+            echo "### 回退目标：\`${previous}\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "回退方式：以 mode=rollback、version=${previous}、sha256=<该版本 Release 资产 SHA256SUMS>、build_id=<该版本清单 build_id> 重新触发本工作流。" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "### 回退目标：无（该版本是首次发布）" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo "本地发布库中的不可变版本与哈希见 Linux 侧 \`releases/<version>/manifest.json\`；" >> "$GITHUB_STEP_SUMMARY"
+          echo "线上若与清单不符，回滚使用**该版本发布时记录的期望哈希**，不重新打包。" >> "$GITHUB_STEP_SUMMARY"
