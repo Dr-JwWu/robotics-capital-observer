@@ -865,7 +865,19 @@ def _check_non_json_text_markers(directory: Path, report: GateReport) -> None:
                         report.fail(f"数据文件含原文摘录/候选内容标记（{marker}）：{relative}")
                         break
         for key in FORBIDDEN_PAYLOAD_TEXT_KEYS:
-            if re.search(rf"[\"'>\s(]{{0,1}}{re.escape(key)}[\"':=\s>)]", lowered):
+            if relative.lower().endswith((".js", ".mjs")):
+                # 程序词汇不是数据字段：URL.password 属性、拒绝词表里的 'password' 都合法。
+                # 不改编译产物去隐藏词；真正的字段/变量赋予非空字面值仍拒绝，且所有文件
+                # 的密钥值和宿主路径扫描在 _scan_dir_for_private_data 中保持不变。
+                found = re.search(
+                    rf"(?<![A-Za-z0-9_$])(?:[\"']{re.escape(key)}[\"']|{re.escape(key)})"
+                    rf"\s*(?::|=(?!=))\s*([\"'])([^\"'\r\n]+)\1",
+                    text,
+                    re.IGNORECASE,
+                )
+            else:
+                found = re.search(rf"[\"'>\s(]{{0,1}}{re.escape(key)}[\"':=\s>)]", lowered)
+            if found:
                 report.fail(f"载荷文本含禁用键形态（{key}）：{relative}")
                 break
 
