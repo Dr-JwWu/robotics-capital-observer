@@ -295,16 +295,23 @@ jobs:
             "${EXPECTED_BASE_URL,,}") : ;;
             *) echo "部署返回的 page_url (${base}) 与已确认站点地址 (${EXPECTED_BASE_URL}) 不一致"; exit 1 ;;
           esac
-          for attempt in 1 2 3 4 5; do
-            if curl -fsS "${base}/status.json" -o ./deployed-status.json; then break; fi
-            echo "第 ${attempt} 次拉取 status.json 失败，等待 CDN 生效…"
-            sleep 10
-          done
-          test -f ./deployed-status.json || { echo "线上 status.json 不可读：无法核验部署身份"; exit 1; }
-          python3 - <<'PY'
-          import json, os, pathlib
-          deployed = json.loads(pathlib.Path("deployed-status.json").read_text(encoding="utf-8"))
-          packaged = json.loads(pathlib.Path("incoming/status.json").read_text(encoding="utf-8"))
+          # HTTP 200 可能仍是 CDN 的旧身份：加已校验 build/attempt 查询值绕旧缓存，
+          # 只有 JSON 身份一致才成功；此核验不宣称无查询 canonical CDN 缓存已同步。
+          # 最多 21 次请求、间隔 30 秒、每次最多 15 秒（请求+等待上限 915 秒），
+          # 覆盖已观察到的 CDN 传播延迟；超时仍拒绝，不因旧缓存放宽校验。
+          for attempt in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21; do
+            if curl -fsS --max-time 15 -H 'Cache-Control: no-cache' "${base}/status.json?rf_verify=${EXPECTED_BUILD_ID}-${attempt}" -o ./deployed-status.json; then
+              if python3 - <<'PY'
+          import json, os, pathlib, re
+          try:
+              deployed = json.loads(pathlib.Path("deployed-status.json").read_text(encoding="utf-8"))
+              packaged = json.loads(pathlib.Path("incoming/status.json").read_text(encoding="utf-8"))
+          except (OSError, ValueError, UnicodeError) as exc:
+              print(f"[verify][retry] status.json 不可解析：{exc}")
+              raise SystemExit(1)
+          if not isinstance(deployed, dict) or not isinstance(packaged, dict):
+              print("[verify][retry] status.json 必须是 JSON 对象")
+              raise SystemExit(1)
           expected_build = os.environ["EXPECTED_BUILD_ID"]
           expected_version = os.environ["VERSION"]
           problems = []
@@ -312,16 +319,31 @@ jobs:
               problems.append(f"线上 build_id={deployed.get('build_id')!r} != 期望 {expected_build!r}")
           if deployed.get("release_version") != expected_version:
               problems.append(f"线上 release_version={deployed.get('release_version')!r} != 期望 {expected_version!r}")
+          if packaged.get("release_version") != expected_version:
+              problems.append("发布包内 release_version 与工作流输入不一致")
           if deployed.get("build_id") != packaged.get("build_id"):
               problems.append("线上 build_id 与发布包内 status.json 不一致")
-          if deployed.get("payload_sha256") != packaged.get("payload_sha256"):
+          packed_payload = packaged.get("payload_sha256")
+          if not isinstance(packed_payload, str) or not re.fullmatch(r"[0-9a-f]{64}", packed_payload):
+              problems.append("发布包内 payload_sha256 缺失或非法")
+          if deployed.get("payload_sha256") != packed_payload:
               problems.append("线上载荷摘要与发布包内 status.json 不一致")
           if problems:
               for item in problems:
-                  print(f"[verify][FAIL] {item}")
+                  print(f"[verify][retry] {item}")
               raise SystemExit(1)
-          print(f"[verify] 线上身份一致：version={expected_version} build_id={expected_build}")
+          print(f"[verify] cache-busted status.json 线上身份一致：version={expected_version} build_id={expected_build}")
+          print("[verify] 此结果不宣称无查询 canonical CDN 缓存已同步")
           PY
+              then
+                exit 0
+              fi
+            fi
+            echo "第 ${attempt} 次 cache-busted status.json 尚未匹配本次身份，等待 CDN 生效…"
+            if [ "${attempt}" -lt 21 ]; then sleep 30; fi
+          done
+          echo "[verify][FAIL] 21 次核验后线上身份仍未匹配，拒绝把旧缓存或未知状态当成部署成功"
+          exit 1
 
       - name: Report rollback target（供需要回退时使用；本步骤不改动线上）
         run: |
