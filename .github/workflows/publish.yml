@@ -98,7 +98,7 @@ jobs:
       url: ${{ steps.deploy.outputs.page_url }}
     env:
       # job 级 env：所有步骤都能读到（原示例只在第一步设置 VERSION，后续步骤拿到的是空串）
-      TARGET_REPO: Dr-JwWu/researcher-finance
+      TARGET_REPO: Dr-JwWu/robotics-capital-observer
       VERSION: ${{ inputs.version }}
       EXPECTED_SHA256: ${{ inputs.sha256 }}
       EXPECTED_BUILD_ID: ${{ inputs.build_id }}
@@ -106,7 +106,7 @@ jobs:
       PACKAGE_NAME: researcher-finance-site-${{ inputs.version }}.tar.gz
       # F1：顺序判定**不能**引用尚未运行的 step 输出（configure-pages 之前 `steps.pages` 为空）。
       # 这里用 job 级常量；站点地址是已确认目标的一部分，改目标时必须同时改这里。
-      PAGES_BASE_URL: https://dr-jwwu.github.io/researcher-finance
+      PAGES_BASE_URL: https://dr-jwwu.github.io/robotics-capital-observer
     steps:
       - name: Checkout the public release repo（只读；运行时才需要 ops/deployment 工具）
         # 必需：下面的校验步骤要执行 `ops/deployment/public_artifact_verify.py`，
